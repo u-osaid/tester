@@ -2,5 +2,7 @@
 
 mod harness;
 
-pub use harness::{Fault, Harness, Violation};
+#[cfg(feature = "cgm")]
+pub use harness::CgmHost;
+pub use harness::{Fault, Harness, HostDriven, Violation};
 pub use pump_shared::SimDevice;

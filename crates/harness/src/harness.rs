@@ -6,9 +6,103 @@ use std::string::String;
 use std::vec::Vec;
 
 use pump_shared::{
-    Action, BleOp, BleResult, Completion, CompletionError, DriverInfo, Engine, Event, Secret,
-    SimDevice, Slot, Timestamp, Uuid,
+    Action, BleOp, BleResult, Completion, CompletionError, DriverInfo, Engine, Event, Notification,
+    OpId, Secret, SimDevice, Slot, Timestamp, Uuid,
 };
+
+/// The part of an engine the harness drives: the host loop of guideline 04.
+///
+/// Every `pump_shared::Engine` is one. A CGM engine is driven through
+/// [`CgmHost`] (feature `cgm`), because `cgm_shared::CgmEngine` is a separate
+/// trait until the generic contract is split out of `pump-shared` (Open: Q5).
+pub trait HostDriven {
+    type Event;
+
+    fn poll_action(&mut self) -> Option<Action>;
+
+    fn poll_event(&mut self) -> Option<Self::Event>;
+
+    fn handle_completion(
+        &mut self,
+        id: OpId,
+        completion: Completion,
+    ) -> Result<(), CompletionError>;
+
+    fn handle_timeout(&mut self, now: Timestamp);
+
+    fn poll_timeout(&self) -> Option<Timestamp>;
+
+    fn handle_notification(&mut self, notification: Notification);
+}
+
+impl<T: Engine + ?Sized> HostDriven for T {
+    type Event = Event;
+
+    fn poll_action(&mut self) -> Option<Action> {
+        Engine::poll_action(self)
+    }
+
+    fn poll_event(&mut self) -> Option<Event> {
+        Engine::poll_event(self)
+    }
+
+    fn handle_completion(
+        &mut self,
+        id: OpId,
+        completion: Completion,
+    ) -> Result<(), CompletionError> {
+        Engine::handle_completion(self, id, completion)
+    }
+
+    fn handle_timeout(&mut self, now: Timestamp) {
+        Engine::handle_timeout(self, now);
+    }
+
+    fn poll_timeout(&self) -> Option<Timestamp> {
+        Engine::poll_timeout(self)
+    }
+
+    fn handle_notification(&mut self, notification: Notification) {
+        Engine::handle_notification(self, notification);
+    }
+}
+
+/// Drives a `cgm_shared::CgmEngine` through the harness.
+#[cfg(feature = "cgm")]
+pub struct CgmHost<'a, E: cgm_shared::CgmEngine + ?Sized>(pub &'a mut E);
+
+#[cfg(feature = "cgm")]
+impl<E: cgm_shared::CgmEngine + ?Sized> HostDriven for CgmHost<'_, E> {
+    type Event = cgm_shared::CgmEvent;
+
+    fn poll_action(&mut self) -> Option<Action> {
+        self.0.poll_action()
+    }
+
+    fn poll_event(&mut self) -> Option<cgm_shared::CgmEvent> {
+        self.0.poll_event()
+    }
+
+    fn handle_completion(
+        &mut self,
+        id: OpId,
+        completion: Completion,
+    ) -> Result<(), CompletionError> {
+        self.0.handle_completion(id, completion)
+    }
+
+    fn handle_timeout(&mut self, now: Timestamp) {
+        self.0.handle_timeout(now);
+    }
+
+    fn poll_timeout(&self) -> Option<Timestamp> {
+        self.0.poll_timeout()
+    }
+
+    fn handle_notification(&mut self, notification: Notification) {
+        self.0.handle_notification(notification);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fault {
@@ -42,11 +136,11 @@ impl fmt::Display for Violation {
 impl std::error::Error for Violation {}
 
 #[derive(Debug)]
-pub struct Harness<D> {
+pub struct Harness<D, E = Event> {
     pub device: D,
     pub store: BTreeMap<Slot, Vec<u8>>,
     pub now: Timestamp,
-    pub events: Vec<Event>,
+    pub events: Vec<E>,
     pub transcript: Vec<String>,
     pub faults: BTreeMap<usize, Fault>,
     pub write_faults: BTreeMap<Uuid, Fault>,
@@ -64,7 +158,7 @@ fn counting(len: usize) -> Vec<u8> {
     (0..len).map(|i| i as u8).collect()
 }
 
-impl<D: SimDevice> Harness<D> {
+impl<D: SimDevice, E> Harness<D, E> {
     pub fn new(device: D) -> Self {
         Self {
             device,
@@ -83,7 +177,10 @@ impl<D: SimDevice> Harness<D> {
         }
     }
 
-    pub fn run(&mut self, engine: &mut dyn Engine) -> Result<(), Violation> {
+    pub fn run<H: HostDriven<Event = E> + ?Sized>(
+        &mut self,
+        engine: &mut H,
+    ) -> Result<(), Violation> {
         for _ in 0..MAX_STEPS {
             self.deliver_notifications(engine);
             self.events
@@ -109,7 +206,11 @@ impl<D: SimDevice> Harness<D> {
         self.timed_out_write = None;
     }
 
-    pub fn advance(&mut self, engine: &mut dyn Engine, by: Duration) -> Result<(), Violation> {
+    pub fn advance<H: HostDriven<Event = E> + ?Sized>(
+        &mut self,
+        engine: &mut H,
+        by: Duration,
+    ) -> Result<(), Violation> {
         let end = Timestamp::from_millis(self.now.as_millis() + by.as_millis() as u64);
         loop {
             self.run(engine)?;
@@ -123,7 +224,7 @@ impl<D: SimDevice> Harness<D> {
         Ok(())
     }
 
-    fn deliver_notifications(&mut self, engine: &mut dyn Engine) {
+    fn deliver_notifications<H: HostDriven<Event = E> + ?Sized>(&mut self, engine: &mut H) {
         while let Some(notification) = self.device.poll_notification(self.now) {
             let key = (notification.service, notification.characteristic);
             if self.subscribed.contains(&key) {
@@ -792,5 +893,100 @@ mod tests {
             harness.run(&mut scripted),
             Err(Violation::ResentAfterTimeout(vec![9]))
         );
+    }
+
+    #[cfg(feature = "cgm")]
+    mod cgm {
+        use super::*;
+        use cgm_shared::{CgmCommand, CgmEngine, CgmEvent};
+
+        #[derive(Default)]
+        struct Cgm {
+            actions: VecDeque<Action>,
+            events: VecDeque<CgmEvent>,
+            timeouts: VecDeque<Timestamp>,
+            completions: usize,
+            notified: usize,
+        }
+
+        impl CgmEngine for Cgm {
+            fn submit(&mut self, _command: CgmCommand) -> Result<CommandId, SubmitError> {
+                Ok(CommandId::new(1))
+            }
+
+            fn stop(&mut self) -> CommandId {
+                CommandId::new(2)
+            }
+
+            fn handle_completion(
+                &mut self,
+                _id: OpId,
+                _completion: Completion,
+            ) -> Result<(), CompletionError> {
+                self.completions += 1;
+                Ok(())
+            }
+
+            fn handle_timeout(&mut self, _now: Timestamp) {
+                self.timeouts.pop_front();
+            }
+
+            fn handle_wall_clock(&mut self, _now: UtcTime) {}
+
+            fn handle_link_lost(&mut self) {}
+
+            fn handle_notification(&mut self, _notification: Notification) {
+                self.notified += 1;
+            }
+
+            fn poll_action(&mut self) -> Option<Action> {
+                self.actions.pop_front()
+            }
+
+            fn poll_event(&mut self) -> Option<CgmEvent> {
+                self.events.pop_front()
+            }
+
+            fn poll_timeout(&self) -> Option<Timestamp> {
+                self.timeouts.front().copied()
+            }
+
+            fn state(&self) -> EngineState {
+                EngineState::Paired
+            }
+        }
+
+        #[test]
+        fn drives_a_cgm_engine() {
+            let mut cgm = Cgm {
+                actions: vec![subscribe(PROGRESS, NotifyKind::Notification), read()].into(),
+                events: vec![CgmEvent::BackfillAvailable {
+                    after: pump_shared::Sequence::new(3),
+                }]
+                .into(),
+                timeouts: vec![Timestamp::from_millis(10)].into(),
+                ..Cgm::default()
+            };
+            let mut harness: Harness<_, CgmEvent> = Harness::new(pump_notifying(&[]));
+            harness.run(&mut CgmHost(&mut cgm)).unwrap();
+            harness.device.pending.push_back(progress(1));
+            harness
+                .advance(&mut CgmHost(&mut cgm), Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(cgm.completions, 2);
+            assert_eq!(cgm.notified, 1);
+            assert!(cgm.timeouts.is_empty());
+            assert_eq!(
+                harness.events,
+                [CgmEvent::BackfillAvailable {
+                    after: pump_shared::Sequence::new(3)
+                }]
+            );
+            assert_eq!(cgm.submit(CgmCommand::Status), Ok(CommandId::new(1)));
+            assert_eq!(cgm.stop(), CommandId::new(2));
+            cgm.handle_wall_clock(UtcTime::from_unix_millis(0));
+            cgm.handle_link_lost();
+            assert_eq!(cgm.state(), EngineState::Paired);
+        }
     }
 }

@@ -4,3 +4,7 @@ members = ["crates/harness", "crates/ble", "crates/cli"]
 
 [patch."https://github.com/u-osaid/simulator"]
 simulator-bridge = { path = "../simulator/crates/bridge" }
+
+# Local development only (branch cgm-host-loop): cgm-shared is not published.
+[patch."ssh://git@github.com/u-osaid/cgm-shared.git"]
+cgm-shared = { path = "../cgm-shared" }

@@ -9,5 +9,10 @@ repository = "https://github.com/u-osaid/tester"
 keywords = ["simulation", "testing", "ble", "medical-device"]
 categories = ["development-tools::testing"]
 
+[features]
+# Drive cgm_shared::CgmEngine as well (Open: Q5).
+cgm = ["dep:cgm-shared"]
+
 [dependencies]
+cgm-shared = { git = "ssh://git@github.com/u-osaid/cgm-shared.git", branch = "main", features = ["sim"], optional = true }
 pump-shared = { git = "https://github.com/u-osaid/pump-shared", branch = "main", features = ["sim"] }
